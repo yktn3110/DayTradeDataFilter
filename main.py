@@ -159,7 +159,7 @@ def drop_unwanted(df: pd.DataFrame) -> pd.DataFrame:
 
 def prune_columns(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [
-        "注文状況補足", "注文日", "約定市場", "注文状況", "市場",
+        "注文状況補足", "注文日", "約定市場", "_注文状況", "市場",
         "取消フラグ", "訂正フラグ", "利用ポイント", "約定日時", "関連番号", "備考", "執行条件", "逆指値条件", "約定日"
     ]
     exist = [c for c in drop_cols if c in df.columns]

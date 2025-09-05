@@ -227,13 +227,21 @@ def parse_daytrade_sheet(
         if row.iloc[0].startswith("(") and ")" in row.iloc[0] and not cur.注文状況補足:
             cur.注文状況補足 = row.iloc[0]
 
-        # 取引種別（現物買/現物売/信新買 など）
-        if "現物買" in line or "現物売" in line or "信新買" in line or "信新売" in line:
-            # より短いセルを優先
-            for c in cells:
-                if any(k in c for k in ["現物買","現物売","信新買","信新売"]):
-                    cur.取引 = c
-                    break
+        # 取引種別（現物買/現物売/信新買/信新売/信返買/信返売 など）
+        TRADE_KEYS = ["現物買", "現物売", "信新買", "信新売", "信返買", "信返売"]
+        # どこかのセルに上記キーワードがあれば最短のセルを採用
+        found = None
+        for c in cells:
+            if any(k in c for k in TRADE_KEYS):
+                found = c
+                break
+        if not found:
+            # 行全体から括弧付きも含めて拾う（例: "信返買 (日計り)" / "信返買（日計り）"）
+            m = re.search(r"(現物買|現物売|信新買|信新売|信返買|信返売)(?:\s*[\(（].*?[\)）])?", line)
+            if m:
+                found = m.group(0)
+        if found:
+            cur.取引 = found
 
         # 注文日 / 注文株数 / 執行条件 / 注文単価
         if "注文日" in line or _DATE_SLASH_RE.search(line):

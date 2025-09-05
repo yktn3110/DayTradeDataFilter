@@ -137,7 +137,10 @@ def parse_daytrade_sheet(
     df_raw = df_raw.fillna("")
 
     # すべてのセルを文字列に正規化し、列を固定幅にしておく
-    df = df_raw.applymap(_norm)
+    try:
+        df = df_raw.map(_norm)          # pandas 2.2+ 推奨API
+    except AttributeError:
+        df = df_raw.applymap(_norm)     # フォールバック
 
     # 新規注文の開始判定：先頭列が数字（注文番号）
     def is_new_order(row: pd.Series) -> bool:
@@ -422,18 +425,31 @@ def drop_unwanted(df: pd.DataFrame) -> pd.DataFrame:
 
     return df.loc[~mask_drop].reset_index(drop=True)
 
+def prune_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    指定された不要列を最終出力から除外する。
+    （内部のフィルタには使ってもOK。）
+    """
+    drop_cols = [
+        "注文日", "約定市場", "注文状況", "市場",
+        "取消フラグ", "訂正フラグ", "利用ポイント", "関連番号", "備考", "執行条件", 
+    ]
+    exist = [c for c in drop_cols if c in df.columns]
+    if exist:
+        df = df.drop(columns=exist)
+    return df
+
+
 def _clean_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Excel への書き込み用に NaT を空文字に変換。
-    NaN も空文字にしておくと安全。
+    Excel（COM）書き込み前に NaT/NaN を安全な文字列へ。
     """
-    df_out = df.copy()
-    for col in df_out.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_out[col]):
-            df_out[col] = df_out[col].dt.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            df_out[col] = df_out[col].replace({pd.NaT: "", pd.NA: "", None: ""})
-    return df_out.fillna("")
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return out.replace({pd.NaT: "", pd.NA: ""}).fillna("")
+
 
 def write_to_same_book_win32com(
     file_path: str | Path,
@@ -542,7 +558,6 @@ def write_to_same_book_win32com(
                 excel.Quit()
             pythoncom.CoUninitialize()
 
-
 if __name__ == "__main__":
     default_file = "デイトレ20250901.xlsx"
     default_sheet = "元データ"
@@ -551,14 +566,21 @@ if __name__ == "__main__":
     sheet_arg = sys.argv[2] if len(sys.argv) >= 3 else default_sheet
 
     try:
-        # 読み込み & 正規化
+        # 1) 読み込み＆正規化
         df = load_and_parse(file_arg, sheet_arg)
-        # 常時除外（取消完了 / 現物買 / 現物売）
+
+        # 2) 常時除外（取消完了 / 現物買 / 現物売）
         df = drop_unwanted(df)
-        # NaT/NaN を Excel 向けにクリーンアップ
+
+        # 3) 出力列を削る（指定の不要データは出さない）
+        df = prune_columns(df)
+
+        # 4) NaT/NaN を安全化（COMの astimezone エラー防止）
         df = _clean_dataframe_for_excel(df)
-        # 同名ブックの「正規化」へ書き出し（win32com）
+
+        # 5) win32com で同名ブック「正規化」に書き出し
         write_to_same_book_win32com(file_arg, df, out_sheet="正規化", table_name="正規化tbl")
+
     except Exception as e:
         print(f"[ERROR] {e}")
         sys.exit(1)

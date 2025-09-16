@@ -52,12 +52,13 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
 
             # 詳細1行目（r+1）
             trade       = df.iat[base+1, 3] if base+1 < n and pd.notna(df.iat[base+1, 3]) else None
-            order_qty   = df.iat[base+1, 6] if base+1 < n and pd.notna(df.iat[base+1, 6]) else None
+            order_qty = df.iat[base+1, 6] if base+1 < n and pd.notna(df.iat[base+1, 6]) else None
+            exec_qty  = int(order_qty) if order_qty is not None and not pd.isna(order_qty) else None            
             order_price = df.iat[base+1, 8] if base+1 < n and pd.notna(df.iat[base+1, 8]) else None
             # （執行条件や注文日などは出力不要のため省略：内部利用したくなればここで拾える）
+            # 数量は「注文株数」をそのまま約定株数として使う（優先）
 
             # 約定行（r+3）
-            exec_qty    = df.iat[base+3, 6] if base+3 < n and pd.notna(df.iat[base+3, 6]) else None
             exec_price  = df.iat[base+3, 7] if base+3 < n and pd.notna(df.iat[base+3, 7]) else None
             excel_serial= df.iat[base+3, 5] if base+3 < n and pd.notna(df.iat[base+3, 5]) else None
 
@@ -209,7 +210,7 @@ def write_to_same_book_win32com(
     excel = None
     wb = None
     try:
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
+        excel = win32.Dispatch("Excel.Application")
         excel.DisplayAlerts = False
         # excel.Visible = True  # デバッグ時に
 
@@ -310,126 +311,154 @@ def _fmt_hms(td_seconds: int) -> str:
 
 def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    正規化DFからFIFOで往復を生成し、全銘柄横断の時間順（エントリー基準）で並べ替えて返す。
-    戻り値: (統計用DataFrame, 出力列リスト cols_out)
+    正規化DF→数量ベース集約の往復を生成（全銘柄横断で時間順採番）。
+    戻り値: (統計用DataFrame, 出力列リスト)
     """
-    # 出力列（統計シートに書く列）※列1/列2は作らない
     cols_out = [
         "No", "エントリー時刻", "エグジット時刻", "時間",
         "銘柄", "買/売", "株数", "注文", "利確/損切",
         "損益（買）", "損益（売）", "損益",
     ]
 
-    # 必要列の存在チェック
-    req = ["銘柄コード", "銘柄名", "取引", "約定日時", "約定単価", "約定株数", "_base_row", "注文番号"]
+    req = ["銘柄コード","銘柄名","取引","約定日時","約定単価","約定株数","_base_row","注文番号"]
     lacks = [c for c in req if c not in df_norm.columns]
     if lacks:
         raise ValueError(f"必要列が見つかりません: {lacks}")
 
-    # 全銘柄横断の時間順（同秒は注文番号で安定化）
-    df = df_norm.sort_values(["約定日時", "注文番号"], na_position="last").reset_index(drop=True)
+    # 全銘柄横断で時間順（同秒は注文番号で安定化）
+    df = df_norm.sort_values(["約定日時","注文番号"], na_position="last").reset_index(drop=True)
 
     from collections import defaultdict, deque
-    queues = defaultdict(lambda: {"LONG": deque(), "SHORT": deque()})
 
-    trips = []
-
-    def _side(entry_trade: str) -> str | None:
-        if not isinstance(entry_trade, str):
-            return None
-        if "信新買" in entry_trade:
-            return "LONG"
-        if "信新売" in entry_trade:
-            return "SHORT"
+    def _side(t: str|None) -> str|None:
+        t = "" if t is None else str(t)
+        if "信新買" in t: return "LONG"
+        if "信新売" in t: return "SHORT"
         return None
 
-    def _is_exit_for(side: str, trade: str) -> bool:
-        if not isinstance(trade, str):
-            return False
-        return (side == "LONG" and "信返売" in trade) or (side == "SHORT" and "信返買" in trade)
+    def _is_exit_for(side: str, t: str|None) -> bool:
+        t = "" if t is None else str(t)
+        return (side=="LONG" and "信返売" in t) or (side=="SHORT" and "信返買" in t)
 
-    def _fmt_hms(td_seconds: int) -> str:
-        h = td_seconds // 3600
-        m = (td_seconds % 3600) // 60
-        s = td_seconds % 60
+    def _fmt_hms(sec: int) -> str:
+        h, m = divmod(sec, 3600)
+        m, s = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}"
+
+    # キュー：銘柄×方向
+    queues = defaultdict(lambda: {"LONG": deque(), "SHORT": deque()})
+    trips: list[dict] = []
 
     for _, row in df.iterrows():
         code = row["銘柄コード"]
         name = row["銘柄名"]
-        trade = str(row["取引"]) if pd.notna(row["取引"]) else ""
+        trade = row["取引"]
         ts = row["約定日時"]
-        price = row["約定単価"]
+        px = row["約定単価"]
         qty = row["約定株数"]
+        on  = row["注文番号"]
         base_row = int(row["_base_row"]) if pd.notna(row["_base_row"]) else None
-
-        if pd.isna(qty) or pd.isna(price) or pd.isna(ts):
-            continue  # 必須欠損はスキップ（エッジは一旦無視）
+        if code is None or pd.isna(qty) or pd.isna(px) or pd.isna(ts):
+            continue
 
         side = _side(trade)
-        if side in ("LONG", "SHORT"):
+        if side in ("LONG","SHORT"):
+            # 新規は貯める（数量・金額合計で後から平均）
             queues[code][side].append({
-                "code": code, "name": name, "trade": trade,
-                "ts": ts, "px": float(price), "qty": int(qty),
-                "base_row": base_row
+                "ts": ts,
+                "qty": int(qty),
+                "sum_px_qty": int(qty),  # 価格×数量（あとで平均）
+                "first_row": base_row,
+                "entry_trade": trade,
             })
             continue
 
-        # 決済側
-        for closing_side in ("LONG", "SHORT"):
-            if _is_exit_for(closing_side, trade):
-                remain = int(qty)
-                while remain > 0 and queues[code][closing_side]:
-                    ent = queues[code][closing_side][0]
-                    use = min(remain, ent["qty"])
-                    remain -= use
-                    ent["qty"] -= use
+        # 返済：必要数量を先頭から吸い上げ、集約1行を作る
+        for closing_side in ("LONG","SHORT"):
+            if not _is_exit_for(closing_side, trade):
+                continue
 
-                    entry_time = ent["ts"]; entry_px = ent["px"]; entry_trade = ent["trade"]; entry_row = ent["base_row"]
-                    exit_time  = ts;         exit_px  = float(price)
-
-                    if closing_side == "LONG":
-                        pnl = (exit_px - entry_px) * use
-                        pnl_buy, pnl_sell = pnl, ""     # ← 片側は空文字に
-                    else:  # SHORT
-                        pnl = (entry_px - exit_px) * use
-                        pnl_buy, pnl_sell = "", pnl     # ← 片側は空文字に
-                    
-                    trips.append({
-                        "_entry_dt": entry_time,   # 並べ替え用（datetime）
-                        "_exit_dt":  exit_time,    # 参考（今は未使用）
-                        "_entry_row": entry_row,   # ハイパーリンク用
-                        "No": None,                # 後で採番
-                        "エントリー時刻": entry_time,  # 一旦 datetime で保持
-                        "エグジット時刻": exit_time,
-                        "時間": _fmt_hms(int((exit_time - entry_time).total_seconds())) if pd.notna(entry_time) and pd.notna(exit_time) else "",
-                        "銘柄": f"{name}  {code}",
-                        "買/売": entry_trade,
-                        "株数": use,
-                        "注文": entry_px,
-                        "利確/損切": exit_px,
-                        "損益（買）": pnl_buy,
-                        "損益（売）": pnl_sell,
-                        "損益": pnl,
-                    })
-
-                    if ent["qty"] == 0:
-                        queues[code][closing_side].popleft()
+            remain = int(qty)
+            if remain <= 0:
                 break
+
+            # 集約用バッファ
+            agg_qty = 0
+            agg_sum_px_qty = 0.0
+            entry_time_first = None
+            entry_trade_first = None
+            entry_row_first = None
+
+            while remain > 0 and queues[code][closing_side]:
+                ent = queues[code][closing_side][0]
+                use = min(remain, ent["qty"])
+                remain -= use
+                ent["qty"] -= use
+
+                # 初回の開始時刻/リンク用の行を保持
+                if entry_time_first is None:
+                    entry_time_first = ent["ts"]
+                    entry_trade_first = ent["entry_trade"]
+                    entry_row_first = ent["first_row"]
+
+                agg_qty += use
+                agg_sum_px_qty += ent["px"] * use
+
+                if ent["qty"] == 0:
+                    queues[code][closing_side].popleft()
+
+            # 充当できた分があれば1行を出力
+            if agg_qty > 0:
+                entry_avg_px = agg_sum_px_qty / agg_qty
+                exit_px = float(px)
+                entry_t = entry_time_first
+                exit_t  = ts
+
+                if closing_side == "LONG":
+                    pnl = (exit_px - entry_avg_px) * agg_qty
+                    pnl_buy, pnl_sell = pnl, ""   # 片側は空文字
+                else:  # SHORT
+                    pnl = (entry_avg_px - exit_px) * agg_qty
+                    pnl_buy, pnl_sell = "", pnl
+
+                trips.append({
+                    "_entry_dt": entry_t,
+                    "_exit_dt":  exit_t,
+                    "_entry_row": entry_row_first,
+                    "No": None,
+                    "エントリー時刻": entry_t,
+                    "エグジット時刻": exit_t,
+                    "時間": _fmt_hms(int((exit_t - entry_t).total_seconds())) if pd.notna(entry_t) and pd.notna(exit_t) else "",
+                    "銘柄": f"{name}  {code}",
+                    "買/売": entry_trade_first,
+                    "株数": agg_qty,
+                    "注文": entry_avg_px,
+                    "利確/損切": exit_px,
+                    "損益（買）": pnl_buy,
+                    "損益（売）": pnl_sell,
+                    "損益": pnl,
+                })
+
+            # 返済数量が残っても（未対応エッジ）は今回は無視方針
+            break
 
     trips_df = pd.DataFrame(trips)
 
     if not trips_df.empty:
-        # ★ エントリー時刻で時間順
+        # エントリー時刻で時間順に並べ替え → No採番
         trips_df = trips_df.sort_values(by=["_entry_dt", "銘柄", "注文"], kind="mergesort").reset_index(drop=True)
-        # 採番
         trips_df["No"] = range(1, len(trips_df) + 1)
-        # 表示を時刻文字列に整形
+
+        # 表示用の時刻文字列化
         for c in ["エントリー時刻", "エグジット時刻"]:
             trips_df[c] = pd.to_datetime(trips_df[c], errors="coerce").dt.strftime("%H:%M:%S")
 
-    # 返却前に内部列を残したままでもOKですが、書き出し時に列選択するのでこのままにします
+        # 損益（買/売）の“空欄”保証（COMでゴミ値化を防止）
+        for c in ["損益（買）", "損益（売）"]:
+            trips_df[c] = trips_df[c].apply(lambda v: "" if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+
     return trips_df, cols_out
+
 
 # ====== 3) 統計シートへ書き出し（No列にハイパーリンク） ======
 
@@ -459,7 +488,7 @@ def write_statistics_win32com(
     pythoncom.CoInitialize()
     excel = None; wb = None
     try:
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
+        excel = win32.Dispatch("Excel.Application")
         excel.DisplayAlerts = False
 
         wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)

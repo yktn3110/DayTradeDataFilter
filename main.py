@@ -87,6 +87,7 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
             trade       = df.iat[base+1, 3] if base+1 < n and pd.notna(df.iat[base+1, 3]) else None
             order_qty = df.iat[base+1, 6] if base+1 < n and pd.notna(df.iat[base+1, 6]) else None
             exec_qty  = int(order_qty) if order_qty is not None and not pd.isna(order_qty) else None            
+            exec_cond = df.iat[base+1, 7] if base+1 < n and pd.notna(df.iat[base+1, 7]) else None
             order_price = df.iat[base+1, 8] if base+1 < n and pd.notna(df.iat[base+1, 8]) else None
             # （執行条件や注文日などは出力不要のため省略：内部利用したくなればここで拾える）
             # 数量は「注文株数」をそのまま約定株数として使う（優先）
@@ -127,6 +128,7 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
                 "銘柄コード": code,
                 "取引": trade,
                 "注文株数": order_qty,
+                "執行条件": exec_cond,
                 "注文単価": order_price,
                 "約定株数": exec_qty,
                 "約定単価": exec_price,
@@ -134,8 +136,9 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
                 "_注文状況": status,     # フィルタ用（後で drop）
                 "_base_row": base + 1,   # ★ Excelの1始まり行番号（エントリ行の先頭）
             })
-            # 次ブロックへ（標準5行構成）
-            r = base + 5
+            # 次の行へ（可変長ブロックや取消完了で短いケースでも安全）
+            r = base + 1
+
             continue
         r += 1
 
@@ -187,14 +190,14 @@ def drop_unwanted(df: pd.DataFrame) -> pd.DataFrame:
 
 # =========================
 # 出力列の削除（不要列）
-#   ユーザ指定: 注文日/約定市場/注文状況/市場/取消フラグ/訂正フラグ/利用ポイント/関連番号/備考/執行条件
+#   ユーザ指定: 注文日/約定市場/注文状況/市場/取消フラグ/訂正フラグ/利用ポイント/関連番号/備考/
 #   → 本パーサでは該当列を生成しないが、将来の拡張互換で drop も用意
 # =========================
 
 def prune_columns(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [
         "注文状況補足", "注文日", "約定市場", "_注文状況", "市場",
-        "取消フラグ", "訂正フラグ", "利用ポイント", "約定日時", "関連番号", "備考", "執行条件", "逆指値条件", "約定日"
+        "取消フラグ", "訂正フラグ", "利用ポイント", "約定日時", "関連番号", "備考", "逆指値条件", "約定日"
     ]
     exist = [c for c in drop_cols if c in df.columns]
     if exist:
@@ -383,35 +386,63 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     trips: list[dict] = []
 
     for _, row in df.iterrows():
-        code = row["銘柄コード"]
-        name = row["銘柄名"]
+        code  = row["銘柄コード"]
+        name  = row["銘柄名"]
         trade = row["取引"]
-        ts = row["約定日時"]
-        px = row["約定単価"]
-        px = row["約定株数"]
-        on  = row["注文番号"]
-        base_row = int(row["_base_row"]) if pd.notna(row["_base_row"]) else None
-        if code is None or pd.isna(px) or pd.isna(px) or pd.isna(ts):
+        ts    = row["約定日時"]
+
+        # 元データから価格と数量を明確に分離
+        exec_px = row.get("約定単価")       # 約定価格（数値）
+        ord_px  = row.get("注文単価")       # 注文価格（成行だと空/記号あり得る）
+        qty     = row.get("約定株数")       # 数量（正規化で注文株数→約定株数を採用しているはず）
+        on      = row.get("注文番号")
+
+        base_row = int(row["_base_row"]) if pd.notna(row.get("_base_row")) else None
+
+        # --- 成行判定（ここで入れる） ---
+        # ※ 前段の parse で「執行条件」を必ず保持しておくこと（pruneで削除しない）
+        exec_cond = str(row.get("執行条件") or "").strip()
+
+        # エントリー価格を決定：成行なら約定価格、その他は注文価格（なければ約定価格にフォールバック）
+        def _num(x):
+            try:
+                return None if x is None or pd.isna(x) else float(x)
+            except Exception:
+                return None
+
+        exec_px_num = _num(exec_px)
+        ord_px_num  = _num(ord_px)
+
+        if exec_cond == "成行":
+            entry_px_resolved = exec_px_num
+        else:
+            entry_px_resolved = ord_px_num if ord_px_num is not None else exec_px_num
+        # ---------------------------------
+
+        # 入力の最低限チェック（コード/数量/価格/時刻）
+        if code is None or qty is None or pd.isna(qty) or entry_px_resolved is None or pd.isna(ts):
             continue
 
+        qty = int(qty)  # 明示的に整数へ
+
         side = _side(trade)
-        if side in ("LONG","SHORT"):
-            # 新規は貯める（数量・金額合計で後から平均）
+        if side in ("LONG", "SHORT"):
+            # 新規は貯める（価格: px / 残数量: qty_remaining）
             queues[code][side].append({
                 "ts": ts,
-                "px": float(px),            # 価格は px キーに
-                "px_remaining": int(px),  # 残数量
+                "px": float(entry_px_resolved),   # ← エントリー価格（成行なら約定価格）
+                "qty_remaining": qty,             # ← 残数量
                 "first_row": base_row,
                 "entry_trade": trade,
             })
             continue
 
         # 返済：必要数量を先頭から吸い上げ、集約1行を作る
-        for closing_side in ("LONG","SHORT"):
+        for closing_side in ("LONG", "SHORT"):
             if not _is_exit_for(closing_side, trade):
                 continue
 
-            remain = int(px)
+            remain = qty
             if remain <= 0:
                 break
 
@@ -424,27 +455,26 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
             while remain > 0 and queues[code][closing_side]:
                 ent = queues[code][closing_side][0]
-                use = min(remain, ent["px"])
+                use = min(remain, ent["qty_remaining"])
                 remain -= use
-                ent["px"] -= use
+                ent["qty_remaining"] -= use
 
-                # 初回の開始時刻/リンク用の行を保持
                 if entry_time_first is None:
-                    entry_time_first = ent["ts"]
+                    entry_time_first  = ent["ts"]
                     entry_trade_first = ent["entry_trade"]
-                    entry_row_first = ent["first_row"]
+                    entry_row_first   = ent["first_row"]
 
                 agg_qty += use
+                # 価格×使用数量を逐次加算（常に正しい加重平均になる）
                 agg_sum_px_qty += ent["px"] * use
-                ent["px_remaining"] -= use
 
-                if ent["px"] == 0:
+                if ent["qty_remaining"] == 0:
                     queues[code][closing_side].popleft()
 
             # 充当できた分があれば1行を出力
             if agg_qty > 0:
                 entry_avg_px = agg_sum_px_qty / agg_qty
-                exit_px = float(px)
+                exit_px = _num(row.get("約定単価"))  # 返済側の価格は約定価格を使用（ここは必ずあるはず）
                 entry_t = entry_time_first
                 exit_t  = ts
 
@@ -466,15 +496,14 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
                     "銘柄": f"{name}  {code}",
                     "買/売": entry_trade_first,
                     "株数": agg_qty,
-                    "注文": entry_avg_px,
+                    "注文": entry_avg_px,      # ← エントリー価格の加重平均（成行も正しく反映）
                     "利確/損切": exit_px,
                     "損益（買）": pnl_buy,
                     "損益（売）": pnl_sell,
                     "損益": pnl,
                 })
 
-            # 返済数量が残っても（未対応エッジ）は今回は無視方針
-            break
+
 
     trips_df = pd.DataFrame(trips)
 

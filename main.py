@@ -4,6 +4,39 @@ from pathlib import Path
 from datetime import datetime, time
 import re
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import re
+
+def default_daytrade_filename() -> str:
+    """日本時間の今日の日付で 'デイトレYYYYMMDD.xlsx' を返す"""
+    today_jst = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y%m%d")
+    return f"デイトレ{today_jst}.xlsx"
+
+def ask_filename_with_default() -> Path:
+    """
+    コンソールでファイル名/日付を入力してもらう。
+    - 空Enter → 既定の今日（JST）の日付ファイル
+    - 8桁の数字（YYYYMMDD）→ 'デイトレYYYYMMDD.xlsx'
+    - それ以外の文字列：
+        - '.xlsx'で終わればそのまま
+        - 終わらなければ拡張子を付ける
+    """
+    default_name = default_daytrade_filename()
+    # ← メッセージに [既定値] を見える形で表示
+    s = input(f"入力ファイル名を指定してください [{default_name}]: ").strip()
+
+    if s == "":
+        name = default_name
+    elif re.fullmatch(r"\d{8}", s):  # 例: 20250916
+        name = f"デイトレ{s}.xlsx"
+    else:
+        name = s if s.lower().endswith(".xlsx") else f"{s}.xlsx"
+
+    p = Path(name).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"指定ファイルが見つかりません: {p}")
+    return p
 
 # =========================
 # 固定マッピング版パーサ（標準ケース）
@@ -355,10 +388,10 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         trade = row["取引"]
         ts = row["約定日時"]
         px = row["約定単価"]
-        qty = row["約定株数"]
+        px = row["約定株数"]
         on  = row["注文番号"]
         base_row = int(row["_base_row"]) if pd.notna(row["_base_row"]) else None
-        if code is None or pd.isna(qty) or pd.isna(px) or pd.isna(ts):
+        if code is None or pd.isna(px) or pd.isna(px) or pd.isna(ts):
             continue
 
         side = _side(trade)
@@ -366,8 +399,8 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
             # 新規は貯める（数量・金額合計で後から平均）
             queues[code][side].append({
                 "ts": ts,
-                "qty": int(qty),
-                "sum_px_qty": int(qty),  # 価格×数量（あとで平均）
+                "px": float(px),            # 価格は px キーに
+                "px_remaining": int(px),  # 残数量
                 "first_row": base_row,
                 "entry_trade": trade,
             })
@@ -378,7 +411,7 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
             if not _is_exit_for(closing_side, trade):
                 continue
 
-            remain = int(qty)
+            remain = int(px)
             if remain <= 0:
                 break
 
@@ -391,9 +424,9 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
             while remain > 0 and queues[code][closing_side]:
                 ent = queues[code][closing_side][0]
-                use = min(remain, ent["qty"])
+                use = min(remain, ent["px"])
                 remain -= use
-                ent["qty"] -= use
+                ent["px"] -= use
 
                 # 初回の開始時刻/リンク用の行を保持
                 if entry_time_first is None:
@@ -403,8 +436,9 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
                 agg_qty += use
                 agg_sum_px_qty += ent["px"] * use
+                ent["px_remaining"] -= use
 
-                if ent["qty"] == 0:
+                if ent["px"] == 0:
                     queues[code][closing_side].popleft()
 
             # 充当できた分があれば1行を出力
@@ -543,48 +577,50 @@ def write_statistics_win32com(
 # =========================
 
 def main():
-    default_file = "デイトレ20250901.xlsx"
+    # 既定シート名
     default_sheet = "元データ"
 
-    file_arg = sys.argv[1] if len(sys.argv) >= 2 else default_file
-    sheet_arg = sys.argv[2] if len(sys.argv) >= 3 else default_sheet
+    # 1) ファイル決定ロジック
+    if len(sys.argv) >= 2:
+        # 既存挙動も維持：引数1でフルパス/相対パス指定可能、引数2でシート名
+        file_arg = Path(sys.argv[1]).expanduser().resolve()
+        if not file_arg.exists():
+            raise FileNotFoundError(f"指定ファイルが見つかりません: {file_arg}")
+        sheet_arg = sys.argv[2] if len(sys.argv) >= 3 else default_sheet
+    else:
+        # 追加：対話で入力（既定は今日の 'デイトレYYYYMMDD.xlsx'）
+        file_arg = ask_filename_with_default()
+        sheet_arg = default_sheet
 
-    # 1) 正規化（固定マッピング）
-    df = parse_daytrade_sheet_fixed(file_arg, sheet_name=sheet_arg)
+    # 2) 正規化（固定マッピング）
+    df = parse_daytrade_sheet_fixed(str(file_arg), sheet_name=sheet_arg)
 
     print("=== 正規化結果: 先頭5行 ===")
     with pd.option_context("display.max_columns", 200, "display.width", 200):
         print(df.head(5))
 
-    # 2) 常時除外（取消完了 / 現物買 / 現物売）
+    # 3) 常時除外（取消完了 / 現物買 / 現物売）
     df = drop_unwanted(df)
 
-    # 3) 正規化シート用の最終テーブル（不要列を落とす）
+    # 4) 正規化シート出力
     df_norm_out = prune_columns(df)
-
-    # 3.1) NaT/NaN を Excel 向けに安全化（astimezone回避）
     df_norm_out_clean = clean_for_excel(df_norm_out)
-
-    # 3.2) ★ 正規化シートに書き出し（継続）
     write_to_same_book_win32com(
-        file_path=file_arg,
+        file_path=str(file_arg),
         df=df_norm_out_clean,
         out_sheet="正規化",
         table_name="正規化tbl",
     )
 
-    # 4) 統計用ラウンドトリップ生成（FIFO）
+    # 5) 統計（数量集約版）生成 & 出力（Noにハイパーリンク）
     df_stats, cols_out = build_round_trips(df)
-
-    # 5) 統計シートへ出力（No列→元データの該当取引へのハイパーリンク）
     write_statistics_win32com(
-        file_path=file_arg,
+        file_path=str(file_arg),
         df_stats=df_stats,
         cols_out=cols_out,
         out_sheet="統計",
-        link_sheet=sheet_arg,  # 元データ
+        link_sheet=sheet_arg,
     )
-
 
 if __name__ == "__main__":
     try:

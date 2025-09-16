@@ -44,14 +44,14 @@ def ask_filename_with_default() -> Path:
 #   - 行位置は 2823 ブロックを基準に固定
 # =========================
 
-_CODE_RE = re.compile(r"(?P<code>\d{4})")
+_CODE_RE = re.compile(r"(?P<code>\d{3,4}[A-Z]?)")
 
 def _split_brand(blob: str):
     """ 'サンリオ   8136   東証' 的な塊 -> (銘柄名, コード, 市場) """
     if not isinstance(blob, str):
         return None, None, None
     txt = re.sub(r"\s+", " ", blob.replace("\u00A0", " ").replace("\u3000", " ")).strip()
-    m = _CODE_RE.search(txt)
+    m = _CODE_RE.search(txt.upper())
     if not m:
         return (txt or None), None, None
     code = m.group("code")

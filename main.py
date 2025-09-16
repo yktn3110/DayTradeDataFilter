@@ -97,8 +97,8 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
                 "約定株数": exec_qty,
                 "約定単価": exec_price,
                 "約定日時": exec_dt,
-                # ↓ フィルタ用（出力しない）
-                "_注文状況": status,
+                "_注文状況": status,     # フィルタ用（後で drop）
+                "_base_row": base + 1,   # ★ Excelの1始まり行番号（エントリ行の先頭）
             })
             # 次ブロックへ（標準5行構成）
             r = base + 5
@@ -279,6 +279,235 @@ def write_to_same_book_win32com(
                 excel.Quit()
             pythoncom.CoUninitialize()
 
+# ====== 2) ラウンドトリップ（往復）を生成 ======
+
+def _side(entry_trade: str) -> str | None:
+    """エントリー側の売買方向（ロング/ショート）を返す"""
+    if not isinstance(entry_trade, str):
+        return None
+    t = entry_trade
+    if "信新買" in t:
+        return "LONG"
+    if "信新売" in t:
+        return "SHORT"
+    return None
+
+def _is_exit_for(side: str, trade: str) -> bool:
+    """決済側が、指定sideの決済か判定"""
+    if not isinstance(trade, str):
+        return False
+    if side == "LONG":
+        return "信返売" in trade  # ロング決済
+    if side == "SHORT":
+        return "信返買" in trade  # ショート決済
+    return False
+
+def _fmt_hms(td_seconds: int) -> str:
+    h = td_seconds // 3600
+    m = (td_seconds % 3600) // 60
+    s = td_seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    正規化DFからFIFOで往復を生成し、全銘柄横断の時間順（エントリー基準）で並べ替えて返す。
+    戻り値: (統計用DataFrame, 出力列リスト cols_out)
+    """
+    # 出力列（統計シートに書く列）※列1/列2は作らない
+    cols_out = [
+        "No", "エントリー時刻", "エグジット時刻", "時間",
+        "銘柄", "買/売", "株数", "注文", "利確/損切",
+        "損益（買）", "損益（売）", "損益",
+    ]
+
+    # 必要列の存在チェック
+    req = ["銘柄コード", "銘柄名", "取引", "約定日時", "約定単価", "約定株数", "_base_row", "注文番号"]
+    lacks = [c for c in req if c not in df_norm.columns]
+    if lacks:
+        raise ValueError(f"必要列が見つかりません: {lacks}")
+
+    # 全銘柄横断の時間順（同秒は注文番号で安定化）
+    df = df_norm.sort_values(["約定日時", "注文番号"], na_position="last").reset_index(drop=True)
+
+    from collections import defaultdict, deque
+    queues = defaultdict(lambda: {"LONG": deque(), "SHORT": deque()})
+
+    trips = []
+
+    def _side(entry_trade: str) -> str | None:
+        if not isinstance(entry_trade, str):
+            return None
+        if "信新買" in entry_trade:
+            return "LONG"
+        if "信新売" in entry_trade:
+            return "SHORT"
+        return None
+
+    def _is_exit_for(side: str, trade: str) -> bool:
+        if not isinstance(trade, str):
+            return False
+        return (side == "LONG" and "信返売" in trade) or (side == "SHORT" and "信返買" in trade)
+
+    def _fmt_hms(td_seconds: int) -> str:
+        h = td_seconds // 3600
+        m = (td_seconds % 3600) // 60
+        s = td_seconds % 60
+        return f"{h}:{m:02d}:{s:02d}"
+
+    for _, row in df.iterrows():
+        code = row["銘柄コード"]
+        name = row["銘柄名"]
+        trade = str(row["取引"]) if pd.notna(row["取引"]) else ""
+        ts = row["約定日時"]
+        price = row["約定単価"]
+        qty = row["約定株数"]
+        base_row = int(row["_base_row"]) if pd.notna(row["_base_row"]) else None
+
+        if pd.isna(qty) or pd.isna(price) or pd.isna(ts):
+            continue  # 必須欠損はスキップ（エッジは一旦無視）
+
+        side = _side(trade)
+        if side in ("LONG", "SHORT"):
+            queues[code][side].append({
+                "code": code, "name": name, "trade": trade,
+                "ts": ts, "px": float(price), "qty": int(qty),
+                "base_row": base_row
+            })
+            continue
+
+        # 決済側
+        for closing_side in ("LONG", "SHORT"):
+            if _is_exit_for(closing_side, trade):
+                remain = int(qty)
+                while remain > 0 and queues[code][closing_side]:
+                    ent = queues[code][closing_side][0]
+                    use = min(remain, ent["qty"])
+                    remain -= use
+                    ent["qty"] -= use
+
+                    entry_time = ent["ts"]; entry_px = ent["px"]; entry_trade = ent["trade"]; entry_row = ent["base_row"]
+                    exit_time  = ts;         exit_px  = float(price)
+
+                    if closing_side == "LONG":
+                        pnl = (exit_px - entry_px) * use
+                        pnl_buy, pnl_sell = pnl, ""     # ← 片側は空文字に
+                    else:  # SHORT
+                        pnl = (entry_px - exit_px) * use
+                        pnl_buy, pnl_sell = "", pnl     # ← 片側は空文字に
+                    
+                    trips.append({
+                        "_entry_dt": entry_time,   # 並べ替え用（datetime）
+                        "_exit_dt":  exit_time,    # 参考（今は未使用）
+                        "_entry_row": entry_row,   # ハイパーリンク用
+                        "No": None,                # 後で採番
+                        "エントリー時刻": entry_time,  # 一旦 datetime で保持
+                        "エグジット時刻": exit_time,
+                        "時間": _fmt_hms(int((exit_time - entry_time).total_seconds())) if pd.notna(entry_time) and pd.notna(exit_time) else "",
+                        "銘柄": f"{name}  {code}",
+                        "買/売": entry_trade,
+                        "株数": use,
+                        "注文": entry_px,
+                        "利確/損切": exit_px,
+                        "損益（買）": pnl_buy,
+                        "損益（売）": pnl_sell,
+                        "損益": pnl,
+                    })
+
+                    if ent["qty"] == 0:
+                        queues[code][closing_side].popleft()
+                break
+
+    trips_df = pd.DataFrame(trips)
+
+    if not trips_df.empty:
+        # ★ エントリー時刻で時間順
+        trips_df = trips_df.sort_values(by=["_entry_dt", "銘柄", "注文"], kind="mergesort").reset_index(drop=True)
+        # 採番
+        trips_df["No"] = range(1, len(trips_df) + 1)
+        # 表示を時刻文字列に整形
+        for c in ["エントリー時刻", "エグジット時刻"]:
+            trips_df[c] = pd.to_datetime(trips_df[c], errors="coerce").dt.strftime("%H:%M:%S")
+
+    # 返却前に内部列を残したままでもOKですが、書き出し時に列選択するのでこのままにします
+    return trips_df, cols_out
+
+# ====== 3) 統計シートへ書き出し（No列にハイパーリンク） ======
+
+def write_statistics_win32com(
+    file_path: str | Path,
+    df_stats: pd.DataFrame,
+    cols_out: list[str],
+    out_sheet: str = "統計",
+    link_sheet: str = "元データ",
+) -> None:
+    """
+    - 統計シートを値で更新（ヘッダ + データ）
+    - No列（A列）に 元データシートのエントリー行へ飛ぶハイパーリンクを設定
+      SubAddress 例:  '元データ'!A{row}
+    """
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except Exception as e:
+        raise RuntimeError("pywin32(win32com) が見つかりません。`pip install pywin32` を実行してください。") from e
+
+    path_abs = Path(file_path).resolve(strict=True)
+    headers = cols_out[:]  # 出力ヘッダ
+    values = df_stats[cols_out].values.tolist() if not df_stats.empty else []
+    link_rows = df_stats["_entry_row"].tolist() if "_entry_row" in df_stats.columns else []
+
+    pythoncom.CoInitialize()
+    excel = None; wb = None
+    try:
+        excel = win32.gencache.EnsureDispatch("Excel.Application")
+        excel.DisplayAlerts = False
+
+        wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)
+
+        # 統計シート取得/作成
+        ws = None
+        for sh in wb.Worksheets:
+            if sh.Name == out_sheet:
+                ws = sh; break
+        if ws is None:
+            ws = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+            ws.Name = out_sheet
+        else:
+            ws.Cells.ClearContents()  # 値のみクリア
+
+        # ヘッダ
+        n_cols = len(headers)
+        if n_cols > 0:
+            ws.Range(ws.Cells(1,1), ws.Cells(1, n_cols)).Value = [headers]
+
+        # データ
+        n_rows = len(values)
+        if n_rows > 0:
+            ws.Range(ws.Cells(2,1), ws.Cells(n_rows+1, n_cols)).Value = values
+
+            # No列（A列）へハイパーリンクを設定
+            for i, base_row in enumerate(link_rows, start=2):  # Excel 行番号（2行目=データ1行目）
+                if base_row and isinstance(base_row, int):
+                    cell = ws.Cells(i, 1)  # A列
+                    try:
+                        ws.Hyperlinks.Add(Anchor=cell, Address="", SubAddress=f"'{link_sheet}'!A{base_row}", TextToDisplay=str(cell.Value))
+                    except Exception:
+                        # ハイパーリンク作成に失敗しても続行
+                        pass
+
+        try:
+            ws.Columns.AutoFit()
+        except Exception:
+            pass
+
+        wb.Save()
+        print(f"書き出し完了（統計）: {path_abs.name} / シート: {out_sheet} / 行数: {n_rows}")
+    finally:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+        if excel is not None:
+            excel.Quit()
+        pythoncom.CoUninitialize()
 
 # =========================
 # メイン
@@ -291,7 +520,7 @@ def main():
     file_arg = sys.argv[1] if len(sys.argv) >= 2 else default_file
     sheet_arg = sys.argv[2] if len(sys.argv) >= 3 else default_sheet
 
-    # 1) 読み込み & 固定マッピングで正規化
+    # 1) 正規化（固定マッピング）
     df = parse_daytrade_sheet_fixed(file_arg, sheet_name=sheet_arg)
 
     print("=== 正規化結果: 先頭5行 ===")
@@ -301,14 +530,32 @@ def main():
     # 2) 常時除外（取消完了 / 現物買 / 現物売）
     df = drop_unwanted(df)
 
-    # 3) 出力列の削除（指定の不要列 + 内部列）
-    df = prune_columns(df)
+    # 3) 正規化シート用の最終テーブル（不要列を落とす）
+    df_norm_out = prune_columns(df)
 
-    # 4) NaT/NaN を Excel 向けに安全化
-    df_out = clean_for_excel(df)
+    # 3.1) NaT/NaN を Excel 向けに安全化（astimezone回避）
+    df_norm_out_clean = clean_for_excel(df_norm_out)
 
-    # 5) win32com で同名ブックの「正規化」に書き込み
-    write_to_same_book_win32com(file_arg, df_out, out_sheet="正規化", table_name="正規化tbl")
+    # 3.2) ★ 正規化シートに書き出し（継続）
+    write_to_same_book_win32com(
+        file_path=file_arg,
+        df=df_norm_out_clean,
+        out_sheet="正規化",
+        table_name="正規化tbl",
+    )
+
+    # 4) 統計用ラウンドトリップ生成（FIFO）
+    df_stats, cols_out = build_round_trips(df)
+
+    # 5) 統計シートへ出力（No列→元データの該当取引へのハイパーリンク）
+    write_statistics_win32com(
+        file_path=file_arg,
+        df_stats=df_stats,
+        cols_out=cols_out,
+        out_sheet="統計",
+        link_sheet=sheet_arg,  # 元データ
+    )
+
 
 if __name__ == "__main__":
     try:

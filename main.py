@@ -353,7 +353,7 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     cols_out = [
         "No", "エントリー時刻", "エグジット時刻", "時間",
         "銘柄", "買/売", "株数", "注文", "利確/損切",
-        "損益（買）", "損益（売）", "損益",
+        "損益（買）", "損益（売）", "損益", "累計損益",
     ]
 
     req = ["銘柄コード","銘柄名","取引","約定日時","約定単価","約定株数","_base_row","注文番号"]
@@ -511,6 +511,10 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         # エントリー時刻で時間順に並べ替え → No採番
         trips_df = trips_df.sort_values(by=["_entry_dt", "銘柄", "注文"], kind="mergesort").reset_index(drop=True)
         trips_df["No"] = range(1, len(trips_df) + 1)
+
+        # 累計損益（No順＝時間順での累積）
+        # 損益は数値（float）想定だが念のため astype(float) で明示
+        trips_df["累計損益"] = trips_df["損益"].astype(float).cumsum()
 
         # 表示用の時刻文字列化
         for c in ["エントリー時刻", "エグジット時刻"]:

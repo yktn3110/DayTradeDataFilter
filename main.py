@@ -524,18 +524,19 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 
 # ====== 3) 統計シートへ書き出し（No列にハイパーリンク） ======
-
 def write_statistics_win32com(
     file_path: str | Path,
     df_stats: pd.DataFrame,
     cols_out: list[str],
     out_sheet: str = "統計",
     link_sheet: str = "元データ",
+    table_name: str = "統計tbl",
+    anchor_cell: str = "A1",   # テーブルを置く起点。既存テーブルがあれば無視
 ) -> None:
     """
-    - 統計シートを値で更新（ヘッダ + データ）
-    - No列（A列）に 元データシートのエントリー行へ飛ぶハイパーリンクを設定
-      SubAddress 例:  '元データ'!A{row}
+    - シート全体はクリアしない。
+    - ListObject(table_name) だけを作成/リサイズして値を更新。
+    - No列（テーブル1列目）の各セルに元データへのハイパーリンクを設定。
     """
     try:
         import pythoncom
@@ -553,10 +554,9 @@ def write_statistics_win32com(
     try:
         excel = win32.Dispatch("Excel.Application")
         excel.DisplayAlerts = False
-
         wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)
 
-        # 統計シート取得/作成
+        # 統計シート取得/作成（※シート全消去はしない）
         ws = None
         for sh in wb.Worksheets:
             if sh.Name == out_sheet:
@@ -564,36 +564,80 @@ def write_statistics_win32com(
         if ws is None:
             ws = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
             ws.Name = out_sheet
-        else:
-            ws.Cells.ClearContents()  # 値のみクリア
 
-        # ヘッダ
+        # 既存 ListObject を探す
+        lo = None
+        try:
+            lo = ws.ListObjects(table_name)
+        except Exception:
+            lo = None
+
+        n_rows = len(values) + 1 if headers else 0
         n_cols = len(headers)
+
+        # テーブルの作成 or リサイズ
+        if lo is None:
+            if n_cols == 0:
+                # 何も書けないが、既存を壊さないため何もしない
+                wb.Save(); return
+            start_cell = ws.Range(anchor_cell)
+            data_range = ws.Range(
+                start_cell,
+                ws.Cells(start_cell.Row + max(0, n_rows - 1), start_cell.Column + max(0, n_cols - 1))
+            )
+            lo = ws.ListObjects.Add(1, data_range, None, 1)  # xlSrcRange=1, xlYes=1
+            lo.Name = table_name
+        else:
+            # 既存テーブルの左上（ヘッダ左上）を起点に、新しいサイズでリサイズ
+            tl = lo.HeaderRowRange.Cells(1, 1)
+            new_range = ws.Range(
+                tl,
+                ws.Cells(tl.Row + max(0, n_rows - 1), tl.Column + max(0, n_cols - 1))
+            )
+            lo.Resize(new_range)
+
+        # ヘッダ行の更新
         if n_cols > 0:
-            ws.Range(ws.Cells(1,1), ws.Cells(1, n_cols)).Value = [headers]
+            lo.HeaderRowRange.Value = [headers]
 
-        # データ
-        n_rows = len(values)
-        if n_rows > 0:
-            ws.Range(ws.Cells(2,1), ws.Cells(n_rows+1, n_cols)).Value = values
+        # 既存データ本体を一旦空に（行数0に）するには、リサイズ済みなので DataBodyRange が None の可能性あり
+        # 値の一括書き込み
+        if len(values) > 0:
+            # DataBodyRange はヘッダ直下の範囲
+            body = lo.DataBodyRange
+            ws.Range(body.Cells(1, 1), body.Cells(len(values), n_cols)).Value = values
 
-            # No列（A列）へハイパーリンクを設定
-            for i, base_row in enumerate(link_rows, start=2):  # Excel 行番号（2行目=データ1行目）
+        # No列（テーブル1列目）にハイパーリンク付与
+        # 既存リンクはセルごとに上書き（重複防止で削除→追加）
+        if len(values) > 0:
+            body = lo.DataBodyRange
+            first_col = body.Columns(1)
+            for i, base_row in enumerate(link_rows, start=1):
+                cell = first_col.Cells(i, 1)
+                try:
+                    # 既存リンク削除（あれば）
+                    for hl in list(cell.Hyperlinks):
+                        hl.Delete()
+                except Exception:
+                    pass
                 if base_row and isinstance(base_row, int):
-                    cell = ws.Cells(i, 1)  # A列
                     try:
-                        ws.Hyperlinks.Add(Anchor=cell, Address="", SubAddress=f"'{link_sheet}'!A{base_row}", TextToDisplay=str(cell.Value))
+                        ws.Hyperlinks.Add(
+                            Anchor=cell,
+                            Address="",
+                            SubAddress=f"'{link_sheet}'!A{base_row}",
+                            TextToDisplay=str(cell.Value)
+                        )
                     except Exception:
-                        # ハイパーリンク作成に失敗しても続行
                         pass
 
         try:
-            ws.Columns.AutoFit()
+            lo.Range.Columns.AutoFit()
         except Exception:
             pass
 
         wb.Save()
-        print(f"書き出し完了（統計）: {path_abs.name} / シート: {out_sheet} / 行数: {n_rows}")
+        print(f"書き出し完了（統計・テーブルのみ更新）: {path_abs.name} / シート: {out_sheet} / 行数: {len(values)}")
     finally:
         if wb is not None:
             wb.Close(SaveChanges=False)

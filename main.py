@@ -413,10 +413,8 @@ def build_round_trips(df_norm: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         exec_px_num = _num(exec_px)
         ord_px_num  = _num(ord_px)
 
-        if exec_cond == "成行":
-            entry_px_resolved = exec_px_num
-        else:
-            entry_px_resolved = ord_px_num if ord_px_num is not None else exec_px_num
+        entry_px_resolved = exec_px_num
+        
         # ---------------------------------
 
         # 入力の最低限チェック（コード/数量/価格/時刻）

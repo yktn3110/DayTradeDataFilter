@@ -577,6 +577,53 @@ def write_statistics_win32com(
         n_rows = len(values) + 1 if headers else 0
         n_cols = len(headers)
 
+                # ★ 余分な旧データ行の削除（ヘッダは残す／列はいじらない）
+        if lo is not None:
+            # 目標データ行数（Excelのテーブルは最低1行必要なので max(1, ...) ）
+            target_rows = max(len(values), 1)
+
+            # Totals 行があると削除が詰まることがあるので一時OFF
+            totals_prev = False
+            try:
+                totals_prev = bool(lo.ShowTotals)
+                if totals_prev:
+                    lo.ShowTotals = False
+            except Exception:
+                pass
+
+            try:
+                cur_rows = lo.ListRows.Count
+                if cur_rows > target_rows:
+                    # 下から削除
+                    for i in range(cur_rows, target_rows, -1):
+                        lo.ListRows(i).Delete()
+                elif cur_rows == 0:
+                    # まれに0件扱い（テーブル壊れ気味）なら、DataBodyRangeクリアで保険
+                    if lo.DataBodyRange is not None:
+                        lo.DataBodyRange.ClearContents()
+            except Exception:
+                # 万一 ListRows が使えない場合の保険
+                try:
+                    if lo.DataBodyRange is not None:
+                        # 先頭 target_rows 行を残して、以降を空に
+                        if len(values) == 0:
+                            lo.DataBodyRange.ClearContents()
+                        else:
+                            start_keep = lo.DataBodyRange.Cells(1, 1)
+                            last_keep  = lo.DataBodyRange.Cells(target_rows, lo.Range.Columns.Count)
+                            clear_from = lo.DataBodyRange.Cells(target_rows+1, 1)
+                            clear_to   = lo.DataBodyRange.Cells(lo.DataBodyRange.Rows.Count, lo.Range.Columns.Count)
+                            ws.Range(clear_from, clear_to).ClearContents()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if totals_prev:
+                        lo.ShowTotals = True
+                except Exception:
+                    pass
+
+
         # テーブルの作成 or リサイズ
         if lo is None:
             if n_cols == 0:

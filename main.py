@@ -88,17 +88,25 @@ def parse_daytrade_sheet_fixed(path: str, sheet_name: str = "元データ") -> p
             order_qty = df.iat[base+1, 6] if base+1 < n and pd.notna(df.iat[base+1, 6]) else None
             exec_qty  = int(order_qty) if order_qty is not None and not pd.isna(order_qty) else None            
             exec_cond = df.iat[base+1, 7] if base+1 < n and pd.notna(df.iat[base+1, 7]) else None
+            exec_cond_str = str(exec_cond or "")
             order_price = df.iat[base+1, 8] if base+1 < n and pd.notna(df.iat[base+1, 8]) else None
             # （執行条件や注文日などは出力不要のため省略：内部利用したくなればここで拾える）
             # 数量は「注文株数」をそのまま約定株数として使う（優先）
 
-            # 約定行（r+3）
-            exec_price  = df.iat[base+3, 7] if base+3 < n and pd.notna(df.iat[base+3, 7]) else None
-            excel_serial= df.iat[base+3, 5] if base+3 < n and pd.notna(df.iat[base+3, 5]) else None
+            # 逆指値（「逆指」「逆指値」などを含む）なら約定/時刻の行を +1 ずらす
+            order_type_str = str(order_type or "")
+            offset = 1 if ("逆指" in order_type_str) else 0
 
-            # 時刻行（r+4）
-            tm          = df.iat[base+4, 5] if base+4 < n and pd.notna(df.iat[base+4, 5]) else None
+            # 約定行（通常: base+3、逆指値: base+4）
+            exec_row = base + 3 + offset
+            # 時刻行（通常: base+4、逆指値: base+5）
+            time_row = base + 4 + offset
 
+            # 約定値/日付/時刻 取得（範囲外は None）
+            exec_price   = df.iat[exec_row, 7] if exec_row < n and pd.notna(df.iat[exec_row, 7]) else None
+            excel_serial = df.iat[exec_row, 5] if exec_row < n and pd.notna(df.iat[exec_row, 5]) else None
+            tm           = df.iat[time_row, 5] if time_row < n and pd.notna(df.iat[time_row, 5]) else None
+            
             # 約定日時の合成（Excelシリアル日付 + time）
             exec_dt = None
             try:

@@ -732,6 +732,155 @@ def write_statistics_win32com(
             excel.Quit()
         pythoncom.CoUninitialize()
 
+
+# ====== 4) 銘柄ごとの損益集計（新シート） ======
+def build_brand_pnl(df_stats: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    統計DFから銘柄ごとの損益集計を作成。
+    出力列: [銘柄, 往復数, 総損益, 平均損益, 最大損益, 最小損益]
+    """
+    cols_out = ["銘柄", "往復数", "総損益", "平均損益", "最大損益", "最小損益"]
+    if df_stats is None or df_stats.empty:
+        return pd.DataFrame(columns=cols_out), cols_out
+
+    # 必要列を防御的に確認
+    need = ["銘柄", "損益"]
+    lacks = [c for c in need if c not in df_stats.columns]
+    if lacks:
+        raise ValueError(f"銘柄損益の集計に必要な列が見つかりません: {lacks}")
+
+    g = df_stats.groupby("銘柄", dropna=False)
+    out = pd.DataFrame({
+        "銘柄": g.size().index,
+        "往復数": g.size().values,
+        "総損益": g["損益"].sum().values,
+        "平均損益": g["損益"].mean().values,
+        "最大損益": g["損益"].max().values,
+        "最小損益": g["損益"].min().values,
+    })
+    # 総損益の降順で並べる
+    out = out.sort_values(by=["総損益", "銘柄"], ascending=[False, True]).reset_index(drop=True)
+    return out, cols_out
+
+
+def write_brand_pnl_win32com(
+    file_path: str | Path,
+    df_brand: pd.DataFrame,
+    cols_out: list[str],
+    out_sheet: str = "銘柄損益",
+    table_name: str = "銘柄損益tbl",
+    anchor_cell: str = "A1",
+) -> None:
+    """
+    銘柄損益シートにテーブルで出力。
+    - シート全体は消さない（既存書式・グラフ維持）
+    - 既存テーブルがあれば ListRows を全削除してから貼り直し
+    - ヘッダ＋最低1行を維持
+    """
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except Exception as e:
+        raise RuntimeError("pywin32(win32com) が見つかりません。`pip install pywin32` を実行してください。") from e
+
+    path_abs = Path(file_path).resolve(strict=True)
+    headers = cols_out[:]
+    values = df_brand[cols_out].values.tolist() if not df_brand.empty else []
+
+    pythoncom.CoInitialize()
+    excel = None; wb = None
+    try:
+        excel = win32.Dispatch("Excel.Application")
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)
+
+        # シート取得/作成
+        ws = None
+        for sh in wb.Worksheets:
+            if sh.Name == out_sheet:
+                ws = sh; break
+        if ws is None:
+            ws = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+            ws.Name = out_sheet
+
+        # 既存テーブル取得
+        lo = None
+        try:
+            lo = ws.ListObjects(table_name)
+        except Exception:
+            lo = None
+
+        n_rows = len(values) + 1 if headers else 0
+        n_cols = len(headers)
+
+        # 既存テーブルの中身を全削除（テーブルは残す）
+        if lo is not None:
+            _tot_prev = False
+            try:
+                _tot_prev = bool(lo.ShowTotals)
+                if _tot_prev:
+                    lo.ShowTotals = False
+            except Exception:
+                pass
+            try:
+                cur = lo.ListRows.Count
+                for i in range(cur, 0, -1):
+                    lo.ListRows(i).Delete()
+                if lo.DataBodyRange is not None:
+                    lo.DataBodyRange.ClearContents()
+            except Exception:
+                try:
+                    if lo.DataBodyRange is not None:
+                        lo.DataBodyRange.ClearContents()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if _tot_prev:
+                        lo.ShowTotals = True
+                except Exception:
+                    pass
+
+        # 作成 or リサイズ
+        if lo is None:
+            if n_cols == 0:
+                wb.Save(); return
+            start_cell = ws.Range(anchor_cell)
+            data_range = ws.Range(
+                start_cell,
+                ws.Cells(start_cell.Row + max(0, n_rows - 1), start_cell.Column + max(0, n_cols - 1))
+            )
+            lo = ws.ListObjects.Add(1, data_range, None, 1)
+            lo.Name = table_name
+        else:
+            tl = lo.HeaderRowRange.Cells(1, 1)
+            new_range = ws.Range(
+                tl,
+                ws.Cells(tl.Row + max(0, n_rows - 1), tl.Column + max(0, n_cols - 1))
+            )
+            lo.Resize(new_range)
+
+        # ヘッダ・値
+        if n_cols > 0:
+            lo.HeaderRowRange.Value = [headers]
+        if len(values) > 0:
+            body = lo.DataBodyRange
+            ws.Range(body.Cells(1, 1), body.Cells(len(values), n_cols)).Value = values
+
+        try:
+            lo.Range.Columns.AutoFit()
+        except Exception:
+            pass
+
+        wb.Save()
+        print(f"書き出し完了（銘柄損益）: {path_abs.name} / シート: {out_sheet} / 行数: {len(values)}")
+    finally:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+        if excel is not None:
+            excel.Quit()
+        pythoncom.CoUninitialize()
+
 # =========================
 # メイン
 # =========================
@@ -780,6 +929,16 @@ def main():
         cols_out=cols_out,
         out_sheet="統計",
         link_sheet=sheet_arg,
+    )
+
+    # 6) 銘柄ごとの損益集計を作成・出力
+    df_brand, cols_brand = build_brand_pnl(df_stats)
+    write_brand_pnl_win32com(
+        file_path=str(file_arg),
+        df_brand=df_brand,
+        cols_out=cols_brand,
+        out_sheet="銘柄損益",
+        table_name="銘柄損益tbl",
     )
 
 if __name__ == "__main__":

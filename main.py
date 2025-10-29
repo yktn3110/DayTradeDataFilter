@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+import shutil
 from datetime import datetime, time
 import re
 import pandas as pd
@@ -8,6 +9,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import re
 import unicodedata  # 全角→半角の正規化
+
+BACKUP_DEST_DIR = Path(r"C:\Users\yuki3\OneDrive\document\05_財務\投資\取引記録\デイトレ")
 
 def default_daytrade_filename() -> str:
     """日本時間の今日の日付で 'デイトレYYYYMMDD.xlsx' を返す"""
@@ -1136,6 +1139,15 @@ def main():
         out_sheet="銘柄損益",
         table_name="銘柄損益tbl",
     )
+
+    # 8) 仕上げたファイルをバックアップ先へコピー保存
+    try:
+        BACKUP_DEST_DIR.mkdir(parents=True, exist_ok=True)
+        dest_path = BACKUP_DEST_DIR / file_arg.name
+        shutil.copy2(file_arg, dest_path)
+        print(f"バックアップコピー完了: {dest_path}")
+    except Exception as e:
+        print(f"[WARN] バックアップコピーに失敗しました: {e}")
 
 if __name__ == "__main__":
     try:

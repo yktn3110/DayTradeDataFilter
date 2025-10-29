@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import re
+import unicodedata  # 全角→半角の正規化
 
 def default_daytrade_filename() -> str:
     """日本時間の今日の日付で 'デイトレYYYYMMDD.xlsx' を返す"""
@@ -50,7 +51,9 @@ def _split_brand(blob: str):
     """ 'サンリオ   8136   東証' 的な塊 -> (銘柄名, コード, 市場) """
     if not isinstance(blob, str):
         return None, None, None
-    txt = re.sub(r"\s+", " ", blob.replace("\u00A0", " ").replace("\u3000", " ")).strip()
+    # 全角→半角正規化（NFKC）し、空白類を単一スペースへ
+    norm = unicodedata.normalize("NFKC", blob).replace("\u00A0", " ").replace("\u3000", " ")
+    txt = re.sub(r"\s+", " ", norm).strip()
     m = _CODE_RE.search(txt.upper())
     if not m:
         return (txt or None), None, None
@@ -589,6 +592,33 @@ def write_statistics_win32com(
         if lo is not None:
             # 目標データ行数（Excelのテーブルは最低1行必要なので max(1, ...) ）
             target_rows = max(len(values), 1)
+
+            # 既存データ行は一旦すべて削除（テーブルは保持）
+            _tot_prev2 = False
+            try:
+                _tot_prev2 = bool(lo.ShowTotals)
+                if _tot_prev2:
+                    lo.ShowTotals = False
+            except Exception:
+                pass
+            try:
+                cur_rows2 = lo.ListRows.Count
+                for i in range(cur_rows2, 0, -1):
+                    lo.ListRows(i).Delete()
+                if lo.DataBodyRange is not None:
+                    lo.DataBodyRange.ClearContents()
+            except Exception:
+                try:
+                    if lo.DataBodyRange is not None:
+                        lo.DataBodyRange.ClearContents()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if _tot_prev2:
+                        lo.ShowTotals = True
+                except Exception:
+                    pass
 
             # Totals 行があると削除が詰まることがあるので一時OFF
             totals_prev = False

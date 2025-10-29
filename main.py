@@ -299,6 +299,14 @@ def write_to_same_book_win32com(
         except Exception:
             lo = None
 
+        # 既存テーブル名が異なる場合は単独テーブルを転用
+        if lo is None and ws.ListObjects.Count == 1:
+            lo = ws.ListObjects(1)
+            try:
+                lo.Name = table_name
+            except Exception:
+                pass
+
         last_row = max(1, n_rows)
         last_col = max(1, n_cols)
         data_range = ws.Range(ws.Cells(1, 1), ws.Cells(last_row, last_col))
@@ -585,6 +593,13 @@ def write_statistics_win32com(
         except Exception:
             lo = None
 
+        if lo is None and ws.ListObjects.Count == 1:
+            lo = ws.ListObjects(1)
+            try:
+                lo.Name = table_name
+            except Exception:
+                pass
+
         n_rows = len(values) + 1 if headers else 0
         n_cols = len(headers)
 
@@ -733,49 +748,59 @@ def write_statistics_win32com(
         pythoncom.CoUninitialize()
 
 
-# ====== 4) 銘柄ごとの損益集計（新シート） ======
-def build_brand_pnl(df_stats: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+# ====== 4) スクリプト用シート（新シート） ======
+def build_script_runs(df_stats: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """統計DFから「スクリプト用」シート向けのデータを生成。
+    出力列: [No, エントリー時刻, エグジット時刻, 銘柄コード, 注文, 利確/損切, 損益]
     """
-    統計DFから銘柄ごとの損益集計を作成。
-    出力列: [銘柄, 往復数, 総損益, 平均損益, 最大損益, 最小損益]
-    """
-    cols_out = ["銘柄", "往復数", "総損益", "平均損益", "最大損益", "最小損益"]
+    cols_out = ["No", "エントリー時刻", "エグジット時刻", "銘柄コード", "注文", "利確/損切", "損益"]
     if df_stats is None or df_stats.empty:
         return pd.DataFrame(columns=cols_out), cols_out
 
-    # 必要列を防御的に確認
-    need = ["銘柄", "損益"]
-    lacks = [c for c in need if c not in df_stats.columns]
-    if lacks:
-        raise ValueError(f"銘柄損益の集計に必要な列が見つかりません: {lacks}")
+    df = df_stats.copy()
 
-    g = df_stats.groupby("銘柄", dropna=False)
+    entry_dt = pd.to_datetime(df.get("_entry_dt"), errors="coerce")
+    exit_dt = pd.to_datetime(df.get("_exit_dt"), errors="coerce")
+    entry_str = entry_dt.dt.strftime("%H:%M:%S").where(entry_dt.notna(), "")
+    exit_str = exit_dt.dt.strftime("%H:%M:%S").where(exit_dt.notna(), "")
+
+    if "銘柄" in df.columns:
+        code_src = df["銘柄"].astype(str)
+    else:
+        code_src = pd.Series([""] * len(df), index=df.index, dtype=object)
+    code_extracted = code_src.str.extract(r"(\d{3,4}[A-Z]?)$", expand=False)
+    code_numeric = pd.to_numeric(code_extracted, errors="coerce")
+    code_final = code_numeric.where(code_numeric.notna(), code_extracted).fillna("")
+
+    no_series = df["No"] if "No" in df.columns else pd.Series(range(1, len(df) + 1), index=df.index)
+
     out = pd.DataFrame({
-        "銘柄": g.size().index,
-        "往復数": g.size().values,
-        "総損益": g["損益"].sum().values,
-        "平均損益": g["損益"].mean().values,
-        "最大損益": g["損益"].max().values,
-        "最小損益": g["損益"].min().values,
+        "No": no_series,
+        "エントリー時刻": entry_str.fillna(""),
+        "エグジット時刻": exit_str.fillna(""),
+        "銘柄コード": code_final,
+        "注文": pd.to_numeric(df.get("注文"), errors="coerce"),
+        "利確/損切": pd.to_numeric(df.get("利確/損切"), errors="coerce"),
+        "損益": pd.to_numeric(df.get("損益"), errors="coerce"),
     })
-    # 総損益の降順で並べる
-    out = out.sort_values(by=["総損益", "銘柄"], ascending=[False, True]).reset_index(drop=True)
-    return out, cols_out
+
+    out["銘柄コード"] = out["銘柄コード"].fillna("")
+
+    return out[cols_out], cols_out
 
 
-def write_brand_pnl_win32com(
+def write_script_sheet_win32com(
     file_path: str | Path,
-    df_brand: pd.DataFrame,
+    df_script: pd.DataFrame,
     cols_out: list[str],
-    out_sheet: str = "銘柄損益",
-    table_name: str = "銘柄損益tbl",
+    out_sheet: str = "スクリプト用",
+    table_name: str = "スクリプト用tbl",
     anchor_cell: str = "A1",
 ) -> None:
     """
-    銘柄損益シートにテーブルで出力。
-    - シート全体は消さない（既存書式・グラフ維持）
-    - 既存テーブルがあれば ListRows を全削除してから貼り直し
-    - ヘッダ＋最低1行を維持
+    「スクリプト用」シートにテーブルとして出力する。
+    - 既存の ListObject を再利用しつつ ListRows を全削除してから貼り付け。
+    - データ0件時もヘッダ+空行を維持。
     """
     try:
         import pythoncom
@@ -785,40 +810,46 @@ def write_brand_pnl_win32com(
 
     path_abs = Path(file_path).resolve(strict=True)
     headers = cols_out[:]
-    values = df_brand[cols_out].values.tolist() if not df_brand.empty else []
+    values = df_script[cols_out].values.tolist() if not df_script.empty else []
 
     pythoncom.CoInitialize()
-    excel = None; wb = None
+    excel = None
+    wb = None
     try:
         excel = win32.Dispatch("Excel.Application")
         excel.DisplayAlerts = False
         wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)
 
-        # シート取得/作成
         ws = None
         for sh in wb.Worksheets:
             if sh.Name == out_sheet:
-                ws = sh; break
+                ws = sh
+                break
         if ws is None:
             ws = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
             ws.Name = out_sheet
 
-        # 既存テーブル取得
         lo = None
         try:
             lo = ws.ListObjects(table_name)
         except Exception:
             lo = None
 
+        if lo is None and ws.ListObjects.Count == 1:
+            lo = ws.ListObjects(1)
+            try:
+                lo.Name = table_name
+            except Exception:
+                pass
+
         n_rows = len(values) + 1 if headers else 0
         n_cols = len(headers)
 
-        # 既存テーブルの中身を全削除（テーブルは残す）
         if lo is not None:
-            _tot_prev = False
+            totals_prev = False
             try:
-                _tot_prev = bool(lo.ShowTotals)
-                if _tot_prev:
+                totals_prev = bool(lo.ShowTotals)
+                if totals_prev:
                     lo.ShowTotals = False
             except Exception:
                 pass
@@ -836,15 +867,15 @@ def write_brand_pnl_win32com(
                     pass
             finally:
                 try:
-                    if _tot_prev:
+                    if totals_prev:
                         lo.ShowTotals = True
                 except Exception:
                     pass
 
-        # 作成 or リサイズ
         if lo is None:
             if n_cols == 0:
-                wb.Save(); return
+                wb.Save()
+                return
             start_cell = ws.Range(anchor_cell)
             data_range = ws.Range(
                 start_cell,
@@ -860,12 +891,168 @@ def write_brand_pnl_win32com(
             )
             lo.Resize(new_range)
 
-        # ヘッダ・値
         if n_cols > 0:
             lo.HeaderRowRange.Value = [headers]
+
         if len(values) > 0:
             body = lo.DataBodyRange
             ws.Range(body.Cells(1, 1), body.Cells(len(values), n_cols)).Value = values
+        else:
+            if lo.DataBodyRange is not None:
+                lo.DataBodyRange.ClearContents()
+
+        try:
+            lo.Range.Columns.AutoFit()
+        except Exception:
+            pass
+
+        wb.Save()
+        print(f"書き出し完了（スクリプト用）: {path_abs.name} / シート: {out_sheet} / 行数: {len(values)}")
+    finally:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+        if excel is not None:
+            excel.Quit()
+        pythoncom.CoUninitialize()
+
+
+# ====== 5) 銘柄ごとの損益集計（新シート） ======
+def build_brand_pnl(df_stats: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """統計DFから銘柄ごとの損益集計を生成。
+    出力列: [銘柄, 往復数, 総損益, 平均損益, 最大損益, 最小損益]
+    """
+    cols_out = ["銘柄", "往復数", "総損益", "平均損益", "最大損益", "最小損益"]
+    if df_stats is None or df_stats.empty:
+        return pd.DataFrame(columns=cols_out), cols_out
+
+    need = ["銘柄", "損益"]
+    lacks = [c for c in need if c not in df_stats.columns]
+    if lacks:
+        raise ValueError(f"銘柄損益の集計に必要な列が見つかりません: {lacks}")
+
+    g = df_stats.groupby("銘柄", dropna=False)
+    out = pd.DataFrame({
+        "銘柄": g.size().index,
+        "往復数": g.size().values,
+        "総損益": g["損益"].sum().values,
+        "平均損益": g["損益"].mean().values,
+        "最大損益": g["損益"].max().values,
+        "最小損益": g["損益"].min().values,
+    })
+    out = out.sort_values(by=["総損益", "銘柄"], ascending=[False, True]).reset_index(drop=True)
+    return out, cols_out
+
+
+def write_brand_pnl_win32com(
+    file_path: str | Path,
+    df_brand: pd.DataFrame,
+    cols_out: list[str],
+    out_sheet: str = "銘柄損益",
+    table_name: str = "銘柄損益tbl",
+    anchor_cell: str = "A1",
+) -> None:
+    """銘柄損益シートにテーブルで出力。
+    - シート全体は消さず、ListObject のみ更新。
+    - No列のハイパーリンクは不要。
+    """
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except Exception as e:
+        raise RuntimeError("pywin32(win32com) が見つかりません。`pip install pywin32` を実行してください。") from e
+
+    path_abs = Path(file_path).resolve(strict=True)
+    headers = cols_out[:]
+    values = df_brand[cols_out].values.tolist() if not df_brand.empty else []
+
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
+    try:
+        excel = win32.Dispatch("Excel.Application")
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(str(path_abs), ReadOnly=False, UpdateLinks=0, IgnoreReadOnlyRecommended=True)
+
+        ws = None
+        for sh in wb.Worksheets:
+            if sh.Name == out_sheet:
+                ws = sh
+                break
+        if ws is None:
+            ws = wb.Worksheets.Add(After=wb.Worksheets(wb.Worksheets.Count))
+            ws.Name = out_sheet
+
+        lo = None
+        try:
+            lo = ws.ListObjects(table_name)
+        except Exception:
+            lo = None
+
+        if lo is None and ws.ListObjects.Count == 1:
+            lo = ws.ListObjects(1)
+            try:
+                lo.Name = table_name
+            except Exception:
+                pass
+
+        n_rows = len(values) + 1 if headers else 0
+        n_cols = len(headers)
+
+        if lo is not None:
+            totals_prev = False
+            try:
+                totals_prev = bool(lo.ShowTotals)
+                if totals_prev:
+                    lo.ShowTotals = False
+            except Exception:
+                pass
+            try:
+                cur = lo.ListRows.Count
+                for i in range(cur, 0, -1):
+                    lo.ListRows(i).Delete()
+                if lo.DataBodyRange is not None:
+                    lo.DataBodyRange.ClearContents()
+            except Exception:
+                try:
+                    if lo.DataBodyRange is not None:
+                        lo.DataBodyRange.ClearContents()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if totals_prev:
+                        lo.ShowTotals = True
+                except Exception:
+                    pass
+
+        if lo is None:
+            if n_cols == 0:
+                wb.Save()
+                return
+            start_cell = ws.Range(anchor_cell)
+            data_range = ws.Range(
+                start_cell,
+                ws.Cells(start_cell.Row + max(0, n_rows - 1), start_cell.Column + max(0, n_cols - 1))
+            )
+            lo = ws.ListObjects.Add(1, data_range, None, 1)
+            lo.Name = table_name
+        else:
+            tl = lo.HeaderRowRange.Cells(1, 1)
+            new_range = ws.Range(
+                tl,
+                ws.Cells(tl.Row + max(0, n_rows - 1), tl.Column + max(0, n_cols - 1))
+            )
+            lo.Resize(new_range)
+
+        if n_cols > 0:
+            lo.HeaderRowRange.Value = [headers]
+
+        if len(values) > 0:
+            body = lo.DataBodyRange
+            ws.Range(body.Cells(1, 1), body.Cells(len(values), n_cols)).Value = values
+        else:
+            if lo.DataBodyRange is not None:
+                lo.DataBodyRange.ClearContents()
 
         try:
             lo.Range.Columns.AutoFit()
@@ -880,7 +1067,6 @@ def write_brand_pnl_win32com(
         if excel is not None:
             excel.Quit()
         pythoncom.CoUninitialize()
-
 # =========================
 # メイン
 # =========================
@@ -891,13 +1077,13 @@ def main():
 
     # 1) ファイル決定ロジック
     if len(sys.argv) >= 2:
-        # 既存挙動も維持：引数1でフルパス/相対パス指定可能、引数2でシート名
+        # 既存挙動も維持: 引数1でフルパス/相対パス指定可、引数2でシート名
         file_arg = Path(sys.argv[1]).expanduser().resolve()
         if not file_arg.exists():
             raise FileNotFoundError(f"指定ファイルが見つかりません: {file_arg}")
         sheet_arg = sys.argv[2] if len(sys.argv) >= 3 else default_sheet
     else:
-        # 追加：対話で入力（既定は今日の 'デイトレYYYYMMDD.xlsx'）
+        # 追加: 対話で入力（既定は今日の 'デイトレYYYYMMDD.xlsx'）
         file_arg = ask_filename_with_default()
         sheet_arg = default_sheet
 
@@ -931,7 +1117,17 @@ def main():
         link_sheet=sheet_arg,
     )
 
-    # 6) 銘柄ごとの損益集計を作成・出力
+    # 6) スクリプト用シート（スクリプト連携用テーブル）
+    df_script, cols_script = build_script_runs(df_stats)
+    write_script_sheet_win32com(
+        file_path=str(file_arg),
+        df_script=df_script,
+        cols_out=cols_script,
+        out_sheet="スクリプト用",
+        table_name="スクリプト用tbl",
+    )
+
+    # 7) 銘柄ごとの損益集計を作成・出力
     df_brand, cols_brand = build_brand_pnl(df_stats)
     write_brand_pnl_win32com(
         file_path=str(file_arg),
